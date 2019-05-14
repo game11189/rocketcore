@@ -59,20 +59,14 @@ class ALU(implicit p: Parameters) extends CoreModule()(p) {
   }
 
   // VADD, VSUB
-  val vin1_0_inv = io.in1(31, 0)
-  val vin1_1_inv = io.in1(61, 32)
-  val vin1_2_inv = io.in1(95, 62)
-  val vin1_3_inv = io.in1(127, 96)
+  val vin1_0_inv = io.in1(63, 0)
+  val vin1_1_inv = io.in1(127, 64)
   
-  val vin2_0_inv = Mux(isSub(io.fn), ~io.in2(31, 0), io.in2(31, 0))
-  val vin2_1_inv = Mux(isSub(io.fn), ~io.in2(61 ,32), io.in2(61, 32))
-  val vin2_2_inv = Mux(isSub(io.fn), ~io.in2(95, 62), io.in2(95, 62))
-  val vin2_3_inv = Mux(isSub(io.fn), ~io.in2(127, 96), io.in2(127, 96))
+  val vin2_0_inv = Mux(isSub(io.fn), ~io.in2(63, 0), io.in2(63, 0))
+  val vin2_1_inv = Mux(isSub(io.fn), ~io.in2(127, 64), io.in2(127, 64))
 
   val vsum0 = vin1_0_inv + vin2_0_inv + isSub(io.fn)
   val vsum1 = vin1_1_inv + vin2_1_inv + isSub(io.fn)
-  val vsum2 = vin1_2_inv + vin2_2_inv + isSub(io.fn)
-  val vsum3 = vin1_3_inv + vin2_3_inv + isSub(io.fn)
 
   // io.adder_out := Cat(vsum3, vsum2, vsum1, vsum0) NEED MUX SOMEHOW
 
@@ -109,7 +103,7 @@ class ALU(implicit p: Parameters) extends CoreModule()(p) {
   val shift_logic = (isCmp(io.fn) && io.cmp_out) | logic | shout
   val out = Mux(io.fn === FN_ADD || io.fn === FN_SUB, io.adder_out, shift_logic)
 
-  io.out := Mux(isVect(io.fn), Cat(vsum3, vsum2, vsum1, vsum0), out)
+  io.out := Mux(isVect(io.fn), Cat(vsum1, vsum0), out)
   if (xLen > 32) {
     require(xLen == 64)
     when (io.dw === DW_32) { io.out := Cat(Fill(32, out(31)), out(31,0)) }

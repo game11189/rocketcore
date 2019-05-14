@@ -160,10 +160,26 @@ class Rocket(id:Int)(implicit p: Parameters) extends CoreModule()(p) {
   val mem_reg_rs2             = Reg(Bits())
   val take_pc_mem             = Wire(Bool())
 
-  val isvect	      = Reg(Bool())
-  val concatdata   = Reg(Bits())
+  val ex_isvect	      = Wire(Bool())
+  val mem_isvect   = Wire(Bool())
+  val wb_isvect    = Wire(Bool())
+  val ex_isstore   = Wire(Bool())
+  val mem_isstore  = Wire(Bool())
+  val wb_isstore   = Wire(Bool())
+  val pipeline_go = Wire(Bool())
+  val concatdata   = Reg(Bits(width=128))
   val vectsize     = 2
-  val vectcount    = Reg(Bits())
+  val vectcount    = Reg(Bits(width=2))
+  val vectaddr	   = Reg(Bits(width=78))
+  val count        = Wire(Bool())
+  val vect_req_valid = Reg(Bool())
+  val vect_alrvalid = Reg(Bool())
+  val vect_stall   = Reg(Bool())
+  val has_takepc   = Wire(Bool())
+  //val has_takepc_addr = Reg(Bool())
+  val ex_reg_del   = Reg(Bool())
+  val mem_reg_del  = Reg(Bool())
+  //val vect_isexe   = Reg(Bool())
 
   val wb_reg_valid           = Reg(Bool())
   val wb_reg_xcpt            = Reg(Bool())
@@ -264,7 +280,10 @@ class Rocket(id:Int)(implicit p: Parameters) extends CoreModule()(p) {
   alu.io.fn := ex_ctrl.alu_fn
   alu.io.in2 := ex_op2.toUInt
   alu.io.in1 := ex_op1.toUInt
-  
+
+  //vect_isexe := Mux(vect_isexe, 0, 
+	//	Mux(mem_isvect && id_inst(6, 0) === 51 && id_inst(14, 12) === 0 && id_inst(31) === 1 && id_pc === (ex_reg_pc + 4), 1, 0)
+
   // multiplier and divider
   val div = Module(new MulDiv(width = xLen,
                               unroll = if(usingFastMulDiv) 8 else 1,
@@ -276,12 +295,13 @@ class Rocket(id:Int)(implicit p: Parameters) extends CoreModule()(p) {
   div.io.req.bits.in2 := ex_rs(1)
   div.io.req.bits.tag := ex_waddr
 
-  ex_reg_valid := !ctrl_killd
+  //ex_reg_valid := (!ctrl_killd) || (mem_isvect && vectcount === 1 && io.dmem.resp.valid)
+  ex_reg_valid := !ctrl_killd || !pipeline_go
   ex_reg_xcpt := !ctrl_killd && id_xcpt
   ex_reg_xcpt_interrupt := csr.io.interrupt && !take_pc && io.imem.resp.valid
-  when (id_xcpt) { ex_reg_cause := id_cause }
+  when (id_xcpt && pipeline_go) { ex_reg_cause := id_cause } // GAME
 
-  when (!ctrl_killd) {
+  when (!ctrl_killd && pipeline_go) {
     ex_ctrl := id_ctrl
     ex_ctrl.csr := id_csr
     ex_reg_btb_hit := io.imem.btb_resp.valid
@@ -294,13 +314,14 @@ class Rocket(id:Int)(implicit p: Parameters) extends CoreModule()(p) {
       val bypass_src = PriorityEncoder(id_bypass_src(i))
       ex_reg_rs_bypass(i) := do_bypass
       ex_reg_rs_lsb(i) := bypass_src
-      when (id_ren(i) && !do_bypass) {
+      when (id_ren(i) && !do_bypass && pipeline_go) { // GAME
         ex_reg_rs_lsb(i) := id_rs(i)(bypass_src.getWidth-1,0)
         ex_reg_rs_msb(i) := id_rs(i) >> bypass_src.getWidth
       }
     }
   }
-  when (!ctrl_killd || csr.io.interrupt) {
+  val ex_next = !ctrl_killd || csr.io.interrupt
+  when (ex_next && pipeline_go) {
     ex_reg_inst := id_inst
     ex_reg_pc := id_pc
   }
@@ -340,14 +361,23 @@ class Rocket(id:Int)(implicit p: Parameters) extends CoreModule()(p) {
   mem_reg_replay := !take_pc_mem_wb && replay_ex
   mem_reg_xcpt := !ctrl_killx && ex_xcpt
   mem_reg_xcpt_interrupt := !take_pc_mem_wb && ex_reg_xcpt_interrupt
-  when (ex_xcpt) { mem_reg_cause := ex_cause }
+  when (ex_xcpt && pipeline_go) { mem_reg_cause := ex_cause } // GAME
 
-  concatdata(127, 64) := Mux(isvect && vectcount === vectsize - 1, io.dmem.resp.bits.data, concatdata(127, 64))
-  concatdata(63, 0) := Mux(isvect && vectcount =/= vectsize - 1, io.dmem.resp.bits.data, concatdata(63, 0))
-  vectcount := Mux((vectcount === vectsize - 1) && io.dmem.resp.valid, 0, 
-	       Mux(isvect && io.dmem.resp.valid, vectcount + 1, 0))
-  
-  when ((!isvect && ex_reg_valid) || (isvect && vectcount === vectsize - 1 && ex_reg_valid) || ex_reg_xcpt_interrupt) {
+  concatdata(127, 64) := Mux(mem_isvect && io.dmem.resp.bits.addr === vectaddr(77, 39), io.dmem.resp.bits.data, concatdata(127, 64))
+  concatdata(63, 0) := Mux(mem_isvect && io.dmem.resp.bits.addr === vectaddr(38, 0), io.dmem.resp.bits.data, concatdata(63, 0))
+
+  count := mem_isvect && io.dmem.resp.valid && ((io.dmem.resp.bits.addr === vectaddr(38, 0) && vectcount === 0) || (io.dmem.resp.bits.addr === vectaddr(77, 39) && vectcount ===1))// || (mem_isvect && mem_isstore)
+
+  vectcount := Mux(pipeline_go || has_takepc, 0,
+	       Mux(count, vectcount + 1, vectcount))
+  has_takepc := ex_reg_del || mem_reg_del
+  ex_reg_del := Mux(take_pc && ex_isvect, 1,
+	 	Mux(ex_next && pipeline_go, 0, ex_reg_del))
+  mem_reg_del := Mux(take_pc && ex_isvect, 1,
+		 Mux((ex_reg_valid || ex_reg_xcpt_interrupt) && pipeline_go && !ex_reg_del, 0, mem_reg_del))
+
+  //when (((ex_reg_valid || ex_reg_xcpt_interrupt) && pipeline_go) || vectcount === 2) {
+  when (((ex_reg_valid || ex_reg_xcpt_interrupt) && pipeline_go)) {
     mem_ctrl := ex_ctrl
     mem_reg_btb_hit := ex_reg_btb_hit
     when (ex_reg_btb_hit) { mem_reg_btb_resp := ex_reg_btb_resp }
@@ -357,6 +387,8 @@ class Rocket(id:Int)(implicit p: Parameters) extends CoreModule()(p) {
     mem_reg_inst := ex_reg_inst
     mem_reg_pc := ex_reg_pc
     mem_reg_wdata := alu.io.out
+    vectaddr(38, 0) := alu.io.out
+    vectaddr(77, 39) := alu.io.out + 8
     when (ex_ctrl.rxs2 && (ex_ctrl.mem || ex_ctrl.rocc)) {
       mem_reg_rs2 := ex_rs(1)
     }
@@ -378,11 +410,12 @@ class Rocket(id:Int)(implicit p: Parameters) extends CoreModule()(p) {
   val ctrl_killm = killm_common || mem_xcpt || fpu_kill_mem
 
   // writeback stage
-  wb_reg_valid := !ctrl_killm
+  wb_reg_valid := (!mem_isvect && !ctrl_killm) || (mem_isvect && vectcount === vectsize && !ctrl_killm)
   wb_reg_replay := replay_mem && !take_pc_wb
   wb_reg_xcpt := mem_xcpt && !take_pc_wb
-  when (mem_xcpt) { wb_reg_cause := mem_cause }
-  when (mem_reg_valid || mem_reg_replay || mem_reg_xcpt_interrupt) {
+  val next_mem = mem_reg_valid || mem_reg_replay || mem_reg_xcpt_interrupt || wb_isvect
+  when (mem_xcpt && pipeline_go) { wb_reg_cause := mem_cause } // GAME
+  when (next_mem && pipeline_go && !has_takepc) {
     wb_ctrl := mem_ctrl
     wb_reg_wdata := Mux(mem_ctrl.fp && mem_ctrl.wxd, io.fpu.toint_data, mem_int_wdata)
     when (mem_ctrl.rocc) {
@@ -392,16 +425,16 @@ class Rocket(id:Int)(implicit p: Parameters) extends CoreModule()(p) {
     wb_reg_pc := mem_reg_pc
   }
 
-  val wb_set_sboard = wb_ctrl.div || wb_dcache_miss || wb_ctrl.rocc
+  val wb_set_sboard = (wb_ctrl.div || wb_dcache_miss || wb_ctrl.rocc) && !(wb_isvect)
   val replay_wb_common = io.dmem.s2_nack || wb_reg_replay
   val wb_rocc_val = wb_reg_valid && wb_ctrl.rocc && !replay_wb_common
   val replay_wb = replay_wb_common || wb_reg_valid && wb_ctrl.rocc && !io.rocc.cmd.ready
   val wb_xcpt = wb_reg_xcpt || csr.io.csr_xcpt
   take_pc_wb := replay_wb || wb_xcpt || csr.io.eret
 
-  when (wb_rocc_val) { wb_reg_rocc_pending := !io.rocc.cmd.ready }
-  when (wb_reg_xcpt) { wb_reg_rocc_pending := Bool(false) }
-
+  when (wb_rocc_val && pipeline_go) { wb_reg_rocc_pending := !io.rocc.cmd.ready }
+  when (wb_reg_xcpt && pipeline_go) { wb_reg_rocc_pending := Bool(false) }
+ // GAME
   // writeback arbitration
   val dmem_resp_xpu = !io.dmem.resp.bits.tag(0).toBool
   val dmem_resp_fpu =  io.dmem.resp.bits.tag(0).toBool
@@ -422,26 +455,35 @@ class Rocket(id:Int)(implicit p: Parameters) extends CoreModule()(p) {
       ll_wen := Bool(true)
     }
   }
-  when (dmem_resp_replay && dmem_resp_xpu) {
+  when (dmem_resp_replay && dmem_resp_xpu && pipeline_go) { // GAME
     div.io.resp.ready := Bool(false)
     if (usingRoCC)
       io.rocc.resp.ready := Bool(false)
     ll_waddr := dmem_resp_waddr
     ll_wen := Bool(true)
   }
-  isvect := wb_ctrl.alu_fn(4) || ex_ctrl.alu_fn(4) || (wb_reg_inst(14, 12) === 7 && wb_reg_inst(6, 0) === 3)
+
+  ex_isstore := (ex_reg_inst(6, 0) === 35 && ex_reg_inst(14, 12) === 7)
+  mem_isstore := (mem_reg_inst(6, 0) === 35 && mem_reg_inst(14, 12) === 7)
+  wb_isstore := (wb_reg_inst(6, 0) === 35 && wb_reg_inst(14, 12) === 7)
+
+  ex_isvect := (ex_reg_inst(14, 12) === 7 && ex_reg_inst(6, 0) === 3) || ex_isstore
+  mem_isvect := (mem_reg_inst(14, 12) === 7 && mem_reg_inst(6, 0) === 3) || mem_isstore
+  wb_isvect := (wb_reg_inst(14, 12) === 7 && wb_reg_inst(6, 0) === 3) || wb_isstore
+  //pipeline_go := (mem_isvect && (mem_reg_valid || mem_reg_replay || mem_reg_xcpt_interrupt) && vectcount === vectsize) || !mem_isvect
+  pipeline_go := (vectcount === 2 || (mem_isvect && wb_isvect && mem_reg_pc === wb_reg_pc) || !mem_isvect || has_takepc)
   val wb_valid = wb_reg_valid && !replay_wb && !csr.io.csr_xcpt
   val wb_wen = wb_valid && wb_ctrl.wxd
-  val rf_wen = wb_wen || ll_wen 
+  val rf_wen = (wb_wen || ll_wen)
   val rf_waddr = Mux(ll_wen, ll_waddr, wb_waddr)
-  val rf_wdata = Mux(dmem_resp_valid && dmem_resp_xpu && isvect && vectcount === vectsize - 1, concatdata,
-		 Mux(dmem_resp_valid && dmem_resp_xpu && !isvect, io.dmem.resp.bits.data,
+  val rf_wdata = Mux(wb_isvect, concatdata,
+		 Mux(dmem_resp_valid && dmem_resp_xpu && !wb_isvect, io.dmem.resp.bits.data,
                  Mux(ll_wen, ll_wdata,
                  Mux(wb_ctrl.csr =/= CSR.N, csr.io.rw.rdata,
                  wb_reg_wdata))))
   when (rf_wen) { rf.write(rf_waddr, rf_wdata)}
-  when (rf_wen && isvect) { rf.write(17, isvect)
-			    rf.write(16, concatdata)}
+  //when (rf_wen && isvect) { rf.write(17, isvect)
+//			    rf.write(16, concatdata)}
 
   // hook up control/status regfile
   csr.io.exception := wb_reg_xcpt
@@ -520,7 +562,7 @@ class Rocket(id:Int)(implicit p: Parameters) extends CoreModule()(p) {
                                 mem_npc)).toUInt // mispredicted branch
   io.imem.flush_icache := wb_reg_valid && wb_ctrl.fence_i
   io.imem.flush_tlb := csr.io.fatc
-  io.imem.resp.ready := !ctrl_stalld || csr.io.interrupt
+  io.imem.resp.ready := (!ctrl_stalld || csr.io.interrupt) && pipeline_go
 
   io.imem.btb_update.valid := mem_reg_valid && !mem_npc_misaligned && mem_wrong_npc && mem_cfi_taken && !take_pc_wb
   io.imem.btb_update.bits.isJump := mem_ctrl.jal || mem_ctrl.jalr
@@ -552,17 +594,24 @@ class Rocket(id:Int)(implicit p: Parameters) extends CoreModule()(p) {
   io.fpu.dmem_resp_data := io.dmem.resp.bits.data_word_bypass
   io.fpu.dmem_resp_type := io.dmem.resp.bits.typ
   io.fpu.dmem_resp_tag := dmem_resp_waddr
-
-  io.dmem.req.valid     := ex_reg_valid && ex_ctrl.mem
+  
+  vect_alrvalid := Mux(pipeline_go, 0, 
+		   Mux(vectcount === 1 && io.dmem.req.valid, 1, vect_alrvalid))
+  vect_req_valid := Mux((ex_reg_valid && ex_ctrl.mem && vectcount === 0 && mem_isvect), 1,
+  Mux(pipeline_go, 0, vect_req_valid))
+  io.dmem.req.valid     := ((ex_reg_valid && ex_ctrl.mem) || (vect_req_valid && vectcount === 2) || (vectcount === 1 && !vect_alrvalid)) && !(vectcount === 1 && vect_alrvalid) //|| (mem_isstore && count)
   val ex_dcache_tag = Cat(ex_waddr, ex_ctrl.fp)
   require(coreDCacheReqTagBits >= ex_dcache_tag.getWidth)
   io.dmem.req.bits.tag  := ex_dcache_tag
-  io.dmem.req.bits.cmd  := ex_ctrl.mem_cmd
+  io.dmem.req.bits.cmd  := Mux(mem_isvect && !mem_isstore, 0,
+			   Mux(mem_isvect && mem_isstore, 1, ex_ctrl.mem_cmd))
   io.dmem.req.bits.typ  := ex_ctrl.mem_type
   io.dmem.req.bits.phys := Bool(false)
-  io.dmem.req.bits.addr := encodeVirtualAddress(ex_rs(0), Mux(isvect, alu.io.adder_out + 8 * vectcount, alu.io.adder_out))
+  io.dmem.req.bits.addr := encodeVirtualAddress(ex_rs(0), Mux(mem_isvect && vectcount === 0, vectaddr(38, 0), 
+							  Mux(mem_isvect && vectcount === 1, vectaddr(77, 39), alu.io.adder_out)))
   io.dmem.s1_kill := killm_common || mem_xcpt
-  io.dmem.s1_data := Mux(mem_ctrl.fp, io.fpu.store_data, mem_reg_rs2)
+  io.dmem.s1_data := Mux(mem_isstore && vectcount === 1, mem_reg_rs2(127, 64),
+		     Mux(mem_ctrl.fp, io.fpu.store_data, mem_reg_rs2))
   io.dmem.invalidate_lr := wb_xcpt
 
   io.rocc.cmd.valid := wb_rocc_val
